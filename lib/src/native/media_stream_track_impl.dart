@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:webrtc_interface/webrtc_interface.dart';
 
 import '../helper.dart';
+import 'event_channel.dart';
 import 'utils.dart';
 
 class MediaStreamTrackNative extends MediaStreamTrack {
@@ -23,6 +24,29 @@ class MediaStreamTrackNative extends MediaStreamTrack {
   final String _kind;
   final String _peerConnectionId;
   final Map<Object?, Object?> settings_;
+
+  // Tracks whose end the native side reports with an "onTrackEnded" event
+  // (Linux portal screen shares, ended from the system's sharing indicator
+  // or by closing the shared window). Weak, so an unused track can go.
+  static final Map<String, WeakReference<MediaStreamTrackNative>> _endable =
+      {};
+  // One listener for the app's lifetime, like the event channel itself.
+  // ignore: cancel_subscriptions
+  static StreamSubscription<Map<String, dynamic>>? _endedSubscription;
+
+  /// Fires [onEnded] when the native side reports that this track ended.
+  void watchEnded() {
+    _endable[_trackId] = WeakReference(this);
+    _endedSubscription ??=
+        FlutterWebRTCEventChannel.instance.handleEvents.stream.listen((data) {
+      final map = data['onTrackEnded'];
+      if (map is! Map) return;
+      final trackId = map['trackId'];
+      if (trackId is! String) return;
+      final track = _endable.remove(trackId)?.target;
+      track?.onEnded?.call();
+    });
+  }
 
   bool _enabled;
 
@@ -124,6 +148,7 @@ class MediaStreamTrackNative extends MediaStreamTrack {
 
   @override
   Future<void> stop() async {
+    _endable.remove(_trackId);
     await WebRTC.invokeMethod(
       'trackDispose',
       <String, dynamic>{'trackId': _trackId},

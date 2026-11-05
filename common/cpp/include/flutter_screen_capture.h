@@ -62,6 +62,33 @@ class FlutterScreenCapture : public MediaListObserver,
  private:
   class ObserverProxy;
 
+#ifdef __linux__
+  // A getDisplayMedia call waiting for the ScreenCast portal's answer.
+  struct PendingPortalShare {
+    std::shared_ptr<MethodResultProxy> result;
+    EncodableMap params;
+    std::string stream_id;
+    std::string track_id;
+    scoped_refptr<RTCDesktopCapturer> capturer;
+  };
+
+  // Starts a share whose source the ScreenCast portal picks (or a stream of
+  // the app's own portal session), and answers the call once the user has
+  // picked or cancelled, from OnStart() or OnError(). The platform thread
+  // never waits for the portal.
+  void GetDisplayMediaFromPortal(
+      scoped_refptr<RTCDesktopCapturer> desktop_capturer,
+      scoped_refptr<RTCMediaStream> stream,
+      const std::string& uuid,
+      double fps,
+      const EncodableMap& video_constraints,
+      EncodableMap params,
+      std::unique_ptr<MethodResultProxy> result);
+  // Stops a share that never got a source and drops its stream and tracks.
+  // Runs on the platform thread.
+  void CancelPortalShare(const PendingPortalShare& pending);
+#endif
+
   bool BuildDesktopSourcesList(const EncodableList& types, bool force_reload);
 
   // Copies of `sources_` and a lookup in it, taken under `sources_mutex_`.
@@ -122,6 +149,15 @@ class FlutterScreenCapture : public MediaListObserver,
   // platform thread is blocked on, it could deadlock.
   std::mutex capturers_mutex_;
   std::vector<scoped_refptr<RTCDesktopCapturer>> active_capturers_;
+
+#ifdef __linux__
+  // Portal shares, by capturer: those waiting for the user's pick, and the
+  // video track of those running, whose end is reported as onTrackEnded.
+  std::mutex portal_mutex_;
+  std::map<RTCDesktopCapturer*, std::shared_ptr<PendingPortalShare>>
+      pending_portal_shares_;
+  std::map<RTCDesktopCapturer*, std::string> portal_share_tracks_;
+#endif
 
   // Loopback audio capturer active during a screen-share session.
   // Null when not capturing or on platforms without loopback support.

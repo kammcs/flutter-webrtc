@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/services.dart';
 
@@ -7,6 +8,7 @@ import 'package:webrtc_interface/webrtc_interface.dart';
 import '../helper.dart';
 import 'event_channel.dart';
 import 'media_stream_impl.dart';
+import 'media_stream_track_impl.dart';
 import 'utils.dart';
 
 class MediaDeviceNative extends MediaDevices {
@@ -89,8 +91,17 @@ class MediaDeviceNative extends MediaDevices {
       String streamId = response['streamId'];
       var stream = MediaStreamNative(streamId, 'local');
       stream.setMediaTracks(response['audioTracks'], response['videoTracks']);
+      if (Platform.isLinux) {
+        // A portal share can end outside the app (the system's sharing
+        // indicator, or the shared window closing).
+        for (var track in stream.getVideoTracks()) {
+          (track as MediaStreamTrackNative).watchEnded();
+        }
+      }
       return stream;
     } on PlatformException catch (e) {
+      // e.message starts with "NotAllowedError" when the user cancelled the
+      // system's picker (Linux).
       throw 'Unable to getDisplayMedia: ${e.message}';
     }
   }

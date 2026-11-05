@@ -386,12 +386,36 @@ void FlutterScreenCapture::OnMediaSourceThumbnailChanged(
 }
 
 void FlutterScreenCapture::OnStart(scoped_refptr<RTCDesktopCapturer> capturer) {
+#ifdef __linux__
+  // A portal share: the user picked a source, so getDisplayMedia succeeds.
+  std::shared_ptr<PendingPortalShare> pending;
+  {
+    std::lock_guard<std::mutex> lock(portal_mutex_);
+    auto it = pending_portal_shares_.find(capturer.get());
+    if (it == pending_portal_shares_.end()) {
+      return;
+    }
+    pending = it->second;
+    pending_portal_shares_.erase(it);
+    portal_share_tracks_[capturer.get()] = pending->track_id;
+  }
+  PostResult([pending]() {
+    pending->result->Success(EncodableValue(pending->params));
+  });
+#endif
 }
 
 void FlutterScreenCapture::OnPaused(
     scoped_refptr<RTCDesktopCapturer> capturer) {}
 
 void FlutterScreenCapture::OnStop(scoped_refptr<RTCDesktopCapturer> capturer) {
+#ifdef __linux__
+  {
+    // Stopped by the app (the track was disposed): not an end to report.
+    std::lock_guard<std::mutex> lock(portal_mutex_);
+    portal_share_tracks_.erase(capturer.get());
+  }
+#endif
   if (loopback_capturer_) {
     loopback_capturer_->Stop();
     loopback_capturer_.reset();
@@ -421,7 +445,151 @@ void FlutterScreenCapture::OnStop(scoped_refptr<RTCDesktopCapturer> capturer) {
 }
 
 void FlutterScreenCapture::OnError(scoped_refptr<RTCDesktopCapturer> capturer) {
+#ifdef __linux__
+  std::shared_ptr<PendingPortalShare> pending;
+  std::string ended_track_id;
+  {
+    std::lock_guard<std::mutex> lock(portal_mutex_);
+    auto it = pending_portal_shares_.find(capturer.get());
+    if (it != pending_portal_shares_.end()) {
+      pending = it->second;
+      pending_portal_shares_.erase(it);
+    } else {
+      auto ended = portal_share_tracks_.find(capturer.get());
+      if (ended != portal_share_tracks_.end()) {
+        ended_track_id = ended->second;
+        portal_share_tracks_.erase(ended);
+      }
+    }
+  }
+
+  if (pending) {
+    // The user cancelled the portal dialog, or the portal failed, before a
+    // source was picked: getDisplayMedia fails, and nothing is left behind.
+    const bool cancelled = capturer->GetSystemPickerResult() ==
+                           RTCDesktopCapturer::kPickerCancelled;
+    PostResult([this, pending, cancelled]() {
+      CancelPortalShare(*pending);
+      if (cancelled) {
+        pending->result->Error(
+            "NotAllowedError",
+            "NotAllowedError: Permission denied: the screen share was "
+            "cancelled");
+      } else {
+        pending->result->Error(
+            "NotReadableError",
+            "NotReadableError: the screen share failed (ScreenCast portal or "
+            "PipeWire)");
+      }
+    });
+    return;
+  }
+
+  if (!ended_track_id.empty()) {
+    // A running portal share ended outside the app: stopped from the
+    // system's sharing indicator, the shared window closed, or the portal
+    // session closed. MediaStreamTrack.onEnded fires in Dart.
+    EncodableMap info;
+    info[EncodableValue("event")] = "onTrackEnded";
+    info[EncodableValue("trackId")] = EncodableValue(ended_track_id);
+    base_->event_channel()->Success(EncodableValue(info));
+  }
+#endif
 }
+
+#ifdef __linux__
+void FlutterScreenCapture::GetDisplayMediaFromPortal(
+    scoped_refptr<RTCDesktopCapturer> desktop_capturer,
+    scoped_refptr<RTCMediaStream> stream,
+    const std::string& uuid,
+    double fps,
+    const EncodableMap& video_constraints,
+    EncodableMap params,
+    std::unique_ptr<MethodResultProxy> result) {
+  desktop_capturer->RegisterDesktopCapturerObserver(observer_proxy_);
+  {
+    std::lock_guard<std::mutex> lock(capturers_mutex_);
+    active_capturers_.push_back(desktop_capturer);
+  }
+
+  scoped_refptr<RTCVideoSource> video_source =
+      base_->factory_->CreateDesktopSource(
+          desktop_capturer, "screen_capture_input",
+          base_->ParseMediaConstraints(video_constraints));
+  scoped_refptr<RTCVideoTrack> track =
+      base_->factory_->CreateVideoTrack(video_source, uuid.c_str());
+
+  EncodableMap info;
+  info[EncodableValue("id")] = EncodableValue(track->id().std_string());
+  info[EncodableValue("label")] = EncodableValue(track->id().std_string());
+  info[EncodableValue("kind")] = EncodableValue(track->kind().std_string());
+  info[EncodableValue("enabled")] = EncodableValue(track->enabled());
+  // getDisplayMedia's video.deviceId.exact with this id shares the same
+  // source again without the portal dialog, while the app runs.
+  EncodableMap settings;
+  settings[EncodableValue("deviceId")] =
+      EncodableValue(desktop_capturer->source().get()
+                         ? desktop_capturer->source()->id().std_string()
+                         : std::string());
+  info[EncodableValue("settings")] = EncodableValue(settings);
+  EncodableList videoTracks;
+  videoTracks.push_back(EncodableValue(info));
+  params[EncodableValue("videoTracks")] = EncodableValue(videoTracks);
+
+  stream->AddTrack(track);
+  base_->local_tracks_[track->id().std_string()] = track;
+  base_->local_streams_[uuid] = stream;
+
+  auto pending = std::make_shared<PendingPortalShare>();
+  pending->result = std::shared_ptr<MethodResultProxy>(std::move(result));
+  pending->params = std::move(params);
+  pending->stream_id = uuid;
+  pending->track_id = track->id().std_string();
+  pending->capturer = desktop_capturer;
+  {
+    std::lock_guard<std::mutex> lock(portal_mutex_);
+    pending_portal_shares_[desktop_capturer.get()] = pending;
+  }
+
+  // Opens the portal dialog (or restores the earlier pick) and returns at
+  // once; OnStart() or OnError() answers the method call.
+  if (desktop_capturer->Start(uint32_t(fps)) == RTCDesktopCapturer::CS_FAILED) {
+    bool still_pending = false;
+    {
+      std::lock_guard<std::mutex> lock(portal_mutex_);
+      still_pending = pending_portal_shares_.erase(desktop_capturer.get()) > 0;
+    }
+    if (still_pending) {
+      CancelPortalShare(*pending);
+      pending->result->Error("NotReadableError",
+                             "NotReadableError: the screen share couldn't "
+                             "start");
+    }
+  }
+}
+
+void FlutterScreenCapture::CancelPortalShare(
+    const PendingPortalShare& pending) {
+  // On the platform thread, which owns the local stream and track maps.
+  pending.capturer->Stop();
+  auto stream_it = base_->local_streams_.find(pending.stream_id);
+  if (stream_it != base_->local_streams_.end()) {
+    scoped_refptr<RTCMediaStream> stream = stream_it->second;
+    vector<scoped_refptr<RTCAudioTrack>> audio_tracks = stream->audio_tracks();
+    for (auto track : audio_tracks.std_vector()) {
+      stream->RemoveTrack(track);
+      base_->local_tracks_.erase(track->id().std_string());
+    }
+    vector<scoped_refptr<RTCVideoTrack>> video_tracks = stream->video_tracks();
+    for (auto track : video_tracks.std_vector()) {
+      stream->RemoveTrack(track);
+      base_->local_tracks_.erase(track->id().std_string());
+    }
+    base_->local_streams_.erase(stream_it);
+  }
+  base_->local_tracks_.erase(pending.track_id);
+}
+#endif
 
 void FlutterScreenCapture::GetDesktopSourceThumbnail(
     std::string source_id,
@@ -581,6 +749,47 @@ void FlutterScreenCapture::GetDisplayMedia(
   if (it != constraints.end() && TypeIs<EncodableMap>(it->second)) {
     video_constraints = GetValue<EncodableMap>(it->second);
   }
+
+#ifdef __linux__
+  // Wayland: the ScreenCast portal is the picker, so no source is listed or
+  // looked up. "pipewireStream" shares a stream of a portal session the app
+  // opened itself (for example a RemoteDesktop session), with no dialog.
+  const EncodableMap pipewire_stream = findMap(video, "pipewireStream");
+  if (pipewire_stream != EncodableMap() ||
+      base_->desktop_device_->HasSystemPicker()) {
+    RTCDesktopCapturerOptions capturer_options;
+    capturer_options.show_cursor = show_cursor;
+    scoped_refptr<RTCDesktopCapturer> desktop_capturer;
+    if (pipewire_stream != EncodableMap()) {
+      const int64_t fd = findLongInt(pipewire_stream, "fd");
+      const int64_t node_id = findLongInt(pipewire_stream, "nodeId");
+      if (fd < 0 || node_id <= 0) {
+        result->Error("Bad Arguments",
+                      "video.pipewireStream needs an fd and a nodeId");
+        return;
+      }
+      desktop_capturer = base_->desktop_device_->CreatePipeWireStreamCapturer(
+          static_cast<int>(fd), static_cast<uint32_t>(node_id),
+          findString(pipewire_stream, "sessionHandle").c_str(),
+          capturer_options);
+    } else {
+      // The source id of an earlier share restores it without the dialog;
+      // "0" (the default) or an unknown id shows the picker.
+      desktop_capturer = base_->desktop_device_->CreateSystemPickerCapturer(
+          true, true, source_id.c_str(), capturer_options);
+    }
+    if (!desktop_capturer.get()) {
+      result->Error("NotReadableError",
+                    "NotReadableError: screen capture through PipeWire isn't "
+                    "available");
+      return;
+    }
+    GetDisplayMediaFromPortal(desktop_capturer, stream, uuid, fps,
+                              video_constraints, std::move(params),
+                              std::move(result));
+    return;
+  }
+#endif
 
   scoped_refptr<MediaSource> source = FindSource(source_id);
 
