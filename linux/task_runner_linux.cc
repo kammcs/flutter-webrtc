@@ -16,10 +16,18 @@ void TaskRunnerLinux::EnqueueTask(TaskClosure task) {
         context,
         [](gpointer user_data)  -> gboolean {
           TaskRunnerLinux* runner = static_cast<TaskRunnerLinux*>(user_data);
-          std::lock_guard<std::mutex> lock(runner->tasks_mutex_);
-          while (!runner->tasks_.empty()) {
-            TaskClosure task = std::move(runner->tasks_.front());
-            runner->tasks_.pop();
+          // Take the queued tasks, then run them without holding the lock. A
+          // task may enqueue another one (a method result answered from a
+          // task, for example), which would otherwise deadlock on
+          // tasks_mutex_ and hang the platform thread.
+          std::queue<TaskClosure> tasks;
+          {
+            std::lock_guard<std::mutex> lock(runner->tasks_mutex_);
+            std::swap(tasks, runner->tasks_);
+          }
+          while (!tasks.empty()) {
+            TaskClosure task = std::move(tasks.front());
+            tasks.pop();
             task();
           }
           return G_SOURCE_REMOVE;
