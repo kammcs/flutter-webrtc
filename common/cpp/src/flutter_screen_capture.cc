@@ -457,10 +457,12 @@ void FlutterScreenCapture::GetDisplayMedia(
   // getDisplayMedia "cursor" video constraint. Defaults to true so behaviour is
   // unchanged when the constraint is absent — that is libwebrtc's own default.
   bool show_cursor = true;
+#ifdef _WIN32
   // Windows window shares: ask for capture without Windows' capture border
   // (the getDisplayMedia "borderless" video constraint). The track's settings
-  // say whether the border is actually off.
+  // say whether the border is actually off. Other platforms ignore it.
   bool borderless = false;
+#endif
 
   const EncodableMap video = findMap(constraints, "video");
   if (video != EncodableMap()) {
@@ -491,7 +493,9 @@ void FlutterScreenCapture::GetDisplayMedia(
     } else if (video.find(EncodableValue("cursor")) != video.end()) {
       show_cursor = findBoolean(video, "cursor");
     }
+#ifdef _WIN32
     borderless = findBoolean(video, "borderless");
+#endif
   }
 
   std::string uuid = base_->GenerateUUID();
